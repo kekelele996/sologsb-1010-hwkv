@@ -2,6 +2,8 @@ import type {
   BrailleToken,
   ProofIssue,
   ProjectState,
+  RuleChangeImpact,
+  RuleOverride,
   RuleSet,
   TextbookLine,
   TranscriptionRule,
@@ -209,7 +211,12 @@ export function analyzeProject(state: ProjectState): ProjectState {
 
   state.lines.forEach((line, index) => {
     const previousSourceContinues = Boolean(state.lines[index - 1]?.source.trimEnd().endsWith('-'));
-    const tokens = transcribeLine(line.source, ruleSet, previousSourceContinues);
+    const lineOverrides = lineOverridesFor(state, ruleSet.id, line.id);
+    const overriddenRuleIds = new Set(lineOverrides.map((override) => override.ruleId));
+    const tokens = transcribeLine(line.source, applyRuleOverrides(ruleSet, lineOverrides), previousSourceContinues);
+    tokens.forEach((token) => {
+      if (token.ruleId && overriddenRuleIds.has(token.ruleId)) token.overridden = true;
+    });
     const analyzed = analyzeLine({ ...line, tokens }, state.lines[index - 1]);
     nextLines.push(analyzed.line);
     issues.push(...analyzed.issues);
@@ -229,6 +236,62 @@ export function updateRuleInSet(ruleSet: RuleSet, ruleId: string, patch: Partial
     ...ruleSet,
     rules: ruleSet.rules.map((rule) => (rule.id === ruleId ? { ...rule, ...patch } : rule)),
   };
+}
+
+export function applyRuleOverrides(ruleSet: RuleSet, overrides: RuleOverride[]): RuleSet {
+  if (overrides.length === 0) return ruleSet;
+  return {
+    ...ruleSet,
+    rules: ruleSet.rules.map((rule) => {
+      const relevant = overrides.filter((override) => override.ruleId === rule.id);
+      if (relevant.length === 0) return rule;
+      return relevant.reduce<TranscriptionRule>((acc, override) => ({ ...acc, ...override.patch }), rule);
+    }),
+  };
+}
+
+function lineOverridesFor(state: ProjectState, ruleSetId: string, lineId: string): RuleOverride[] {
+  return (state.overrides ?? []).filter((override) => override.ruleSetId === ruleSetId && override.lineId === lineId);
+}
+
+function diffTokenPositions(before: BrailleToken[], after: BrailleToken[]): number[] {
+  const positions = new Set<number>();
+  const max = Math.max(before.length, after.length);
+  for (let index = 0; index < max; index += 1) {
+    const a = before[index];
+    const b = after[index];
+    if (!a || !b || a.text !== b.text || a.braille !== b.braille || a.kind !== b.kind) {
+      positions.add((b ?? a).offset);
+    }
+  }
+  return [...positions].sort((x, y) => x - y);
+}
+
+export function previewRuleChange(state: ProjectState, ruleId: string, patch: Partial<TranscriptionRule>): RuleChangeImpact[] {
+  const ruleSet = state.ruleSets.find((item) => item.id === state.activeRuleSetId) ?? state.ruleSets[0];
+  const patchedSet = updateRuleInSet(ruleSet, ruleId, patch);
+  const impacts: RuleChangeImpact[] = [];
+
+  state.lines.forEach((line, index) => {
+    const lineOverrides = lineOverridesFor(state, ruleSet.id, line.id);
+    const continuesPrevious = Boolean(state.lines[index - 1]?.source.trimEnd().endsWith('-'));
+    const beforeTokens = transcribeLine(line.source, applyRuleOverrides(ruleSet, lineOverrides), continuesPrevious);
+    const afterTokens = transcribeLine(line.source, applyRuleOverrides(patchedSet, lineOverrides), continuesPrevious);
+    const positions = diffTokenPositions(beforeTokens, afterTokens);
+    if (positions.length > 0) {
+      impacts.push({
+        lineId: line.id,
+        lineIndex: index,
+        source: line.source,
+        before: beforeTokens.map((token) => token.braille).join(''),
+        after: afterTokens.map((token) => token.braille).join(''),
+        positions,
+        pinned: lineOverrides.some((override) => override.ruleId === ruleId),
+      });
+    }
+  });
+
+  return impacts;
 }
 
 export function makeRule(source: string, output: string, suspicious: boolean, kind: TranscriptionRule['kind'] = 'contraction'): TranscriptionRule {

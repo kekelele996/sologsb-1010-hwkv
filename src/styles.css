@@ -157,6 +157,38 @@ md-linear-progress { width: 100%; --md-linear-progress-active-indicator-color: #
 .braille-token span { margin-top: 3px; font: 22px/1.05 "Apple Braille", "Segoe UI Symbol", sans-serif; }
 .braille-token.suspicious { background: #fff3df; box-shadow: inset 0 -2px #e3a342; }
 .braille-token.error { background: #ffebe9; color: var(--danger); }
+.braille-token.overridden { background: #e4eefb; box-shadow: inset 0 -2px #6f8fc0; }
+.override-strip { padding-top: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.override-chip {
+  display: inline-block; max-width: 100%; padding: 4px 8px; border-radius: 5px;
+  background: #e4eefb; color: #2c4a75; font-size: 10px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 40; display: grid; place-items: center;
+  background: rgba(14, 30, 26, .45); padding: 28px;
+}
+.preview-dialog {
+  width: min(640px, 92vw); max-height: 84vh; display: flex; flex-direction: column;
+  background: #fbfdfb; border-radius: 16px; box-shadow: 0 18px 50px rgba(10, 25, 21, .35); overflow: hidden;
+}
+.preview-head { padding: 20px 22px 14px; border-bottom: 1px solid var(--line); }
+.preview-head h2 { margin: 4px 0 6px; font-size: 17px; }
+.preview-head p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.impact-list { flex: 1; overflow: auto; padding: 12px 22px; display: flex; flex-direction: column; gap: 10px; }
+.impact-row { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: white; }
+.impact-row.pinned { border-color: #b9cbe8; background: #f4f8fe; }
+.impact-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.impact-title strong { font-size: 12px; }
+.impact-positions { color: var(--muted); font-size: 10px; }
+.impact-pinned { padding: 2px 6px; border-radius: 4px; background: #e4eefb; color: #2c4a75; font-size: 10px; }
+.impact-source { margin-top: 5px; color: #3b4b46; font-size: 12px; }
+.impact-diff { margin-top: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-family: "Apple Braille", "Segoe UI Symbol", sans-serif; font-size: 18px; }
+.impact-before { color: #8a5a5a; text-decoration: line-through; }
+.impact-arrow { color: var(--muted); font-family: sans-serif; font-size: 13px; }
+.impact-after { color: #1f4d3a; }
+.preview-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 22px; border-top: 1px solid var(--line); background: #f4f8f6; }
 .space-token { width: 10px; height: 28px; border-bottom: 1px dotted #b7c2be; }
 .empty-preview { color: #98a39f; font-size: 12px; }
 .line-warnings { padding-top: 8px; display: flex; flex-wrap: wrap; gap: 5px; }

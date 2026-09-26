@@ -28,7 +28,26 @@ export interface BrailleToken {
   kind: RuleKind;
   ruleId?: string;
   suspicious: boolean;
+  overridden?: boolean;
   offset: number;
+}
+
+export interface RuleOverride {
+  id: string;
+  ruleSetId: string;
+  ruleId: string;
+  lineId: string;
+  patch: Partial<Pick<TranscriptionRule, 'source' | 'output' | 'enabled'>>;
+}
+
+export interface RuleChangeImpact {
+  lineId: string;
+  lineIndex: number;
+  source: string;
+  before: string;
+  after: string;
+  positions: number[];
+  pinned: boolean;
 }
 
 export interface TextbookLine {
@@ -69,6 +88,7 @@ export interface ProjectState {
   lines: TextbookLine[];
   selectedLineId: string;
   issues: ProofIssue[];
+  overrides: RuleOverride[];
   versions: VersionSnapshot[];
   lastCheckedAt: string;
   updatedAt: string;
