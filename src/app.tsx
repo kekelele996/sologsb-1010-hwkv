@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import { analyzeProject, brailleCellCount, describeOverride, makeRule, mergeOverride, normalizeOverrides, outputText, previewRuleImpact, updateRuleInSet } from './braille';
+import type { RuleImpactLine } from './braille';
 import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import type { HistoryState, ProofIssue, ProjectState, RuleSet, TextbookLine, TranscriptionRule, VersionSnapshot } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -93,6 +94,94 @@ function issueLabel(issue: ProofIssue): string {
   return '建议';
 }
 
+/** 待确认的规则修改：先预览影响范围，再决定只改当前行还是应用全文。 */
+interface PendingRuleEdit {
+  ruleId: string;
+  patch: Partial<TranscriptionRule>;
+  items: RuleImpactLine[];
+  lineId: string;
+}
+
+function describePatch(rule: TranscriptionRule | undefined, patch: Partial<TranscriptionRule>): string {
+  const name = rule ? `「${rule.source}」` : '该规则';
+  const parts: string[] = [];
+  if (patch.enabled !== undefined) parts.push(patch.enabled ? '启用' : '停用');
+  if (patch.source !== undefined) parts.push(`匹配 ${rule?.source ?? ''} → ${patch.source}`);
+  if (patch.output !== undefined) parts.push(`输出 ${rule?.output ?? ''} → ${patch.output}`);
+  return `${name}：${parts.join('；')}`;
+}
+
+function RuleImpactDialog({
+  pending,
+  rule,
+  currentLineIndex,
+  onCancel,
+  onApplyLine,
+  onApplyAll,
+}: {
+  pending: PendingRuleEdit;
+  rule: TranscriptionRule | undefined;
+  currentLineIndex: number;
+  onCancel: () => void;
+  onApplyLine: () => void;
+  onApplyAll: () => void;
+}) {
+  const totalChanges = pending.items.reduce((sum, item) => sum + item.changes.length, 0);
+  const currentAffected = pending.items.some((item) => item.lineId === pending.lineId);
+
+  return (
+    <div class="preview-overlay" onClick={onCancel}>
+      <div class="preview-dialog" role="dialog" aria-modal="true" aria-label="规则修改预览" onClick={(event) => event.stopPropagation()}>
+        <span class="eyebrow">规则修改预览</span>
+        <h2>{describePatch(rule, pending.patch)}</h2>
+        {pending.items.length > 0 ? (
+          <>
+            <p class="preview-summary">
+              将影响 <strong>{pending.items.length}</strong> 行、共 <strong>{totalChanges}</strong> 处转写。
+              可以只作为当前行的例外，或应用到全文。
+            </p>
+            <div class="preview-list scroll-pane">
+              {pending.items.map((item) => (
+                <div class={`preview-line ${item.lineId === pending.lineId ? 'current' : ''}`} key={item.lineId}>
+                  <div class="preview-line-head">
+                    <strong>第 {item.lineIndex + 1} 行</strong>
+                    {item.lineId === pending.lineId && <span class="current-tag">当前行</span>}
+                    <span class="preview-line-source">{item.source}</span>
+                  </div>
+                  <ul>
+                    {item.changes.map((change, index) => (
+                      <li key={`${change.start}-${index}`}>
+                        <span class="change-pos">第 {change.start + 1} 字符「{change.text}」</span>
+                        <span class="change-diff"><s>{change.before || '∅'}</s> → <b>{change.after || '∅'}</b></span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+          </>
+        ) : (
+          <p class="preview-summary">此修改不影响任何课文行的转写结果，可直接确认。</p>
+        )}
+        <div class="preview-actions">
+          <md-text-button onClick={onCancel}>取消</md-text-button>
+          {pending.items.length > 0 && currentLineIndex >= 0 && (
+            <md-filled-tonal-button disabled={!currentAffected} onClick={onApplyLine}>
+              仅第 {currentLineIndex + 1} 行（行级例外）
+            </md-filled-tonal-button>
+          )}
+          <md-filled-button onClick={onApplyAll}>
+            {pending.items.length > 0 ? `应用到全部 ${pending.items.length} 行` : '确认修改'}
+          </md-filled-button>
+        </div>
+        {pending.items.length > 0 && currentLineIndex >= 0 && !currentAffected && (
+          <p class="preview-hint">当前选中的第 {currentLineIndex + 1} 行不受此修改影响，无法只应用到该行。</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function Section({ title, subtitle, action, children }: { title: string; subtitle?: string; action?: ComponentChildren; children: ComponentChildren }) {
   return (
     <section class="panel-section">
@@ -112,6 +201,7 @@ function RuleSetPanel({
   state,
   onSelect,
   onUpdateRule,
+  onRequestRuleEdit,
   onToggleContractions,
   onAddRule,
   onRecheck,
@@ -119,6 +209,7 @@ function RuleSetPanel({
   state: ProjectState;
   onSelect: (id: string) => void;
   onUpdateRule: (ruleId: string, patch: Record<string, unknown>) => void;
+  onRequestRuleEdit: (ruleId: string, patch: Partial<TranscriptionRule>) => void;
   onToggleContractions: () => void;
   onAddRule: (source: string, output: string, suspicious: boolean) => void;
   onRecheck: () => void;
@@ -128,11 +219,27 @@ function RuleSetPanel({
   const [newSource, setNewSource] = useState('');
   const [newOutput, setNewOutput] = useState('');
   const [suspicious, setSuspicious] = useState(true);
+  // 文本编辑先进入本地草稿，失焦或回车时才触发影响预览
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
   const visibleRules = showAllRules ? active.rules : active.rules.filter((rule) => rule.kind === 'contraction' || rule.suspicious);
+
+  const commitDraft = (rule: TranscriptionRule, field: 'source' | 'output') => {
+    const key = `${rule.id}:${field}`;
+    const draft = drafts[key];
+    if (draft === undefined) return;
+    setDrafts((current) => {
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+    const value = draft.trim();
+    if (!value || value === rule[field]) return;
+    onRequestRuleEdit(rule.id, { [field]: value });
+  };
 
   return (
     <aside class="left-panel scroll-pane" aria-label="规则集与规则编辑">
-      <Section title="规则集" subtitle="切换后会自动重转录全部行">
+      <Section title="规则集" subtitle="切换后会自动重转录全部行；行级例外保持不变">
         <div class="stack-sm">
           {state.ruleSets.map((ruleSet) => (
             <button class={`rule-set-card ${ruleSet.id === active.id ? 'active' : ''}`} key={ruleSet.id} onClick={() => onSelect(ruleSet.id)}>
@@ -159,22 +266,35 @@ function RuleSetPanel({
         </div>
       </Section>
 
-      <Section title="缩写与标点" subtitle="可疑规则会在校对区生成提醒">
+      <Section title="缩写与标点" subtitle="启停或修改会先预览影响范围，再决定只改当前行还是应用全文">
         <div class="rule-list">
           {visibleRules.map((rule) => (
             <div class={`rule-row ${rule.suspicious ? 'suspicious' : ''}`} key={rule.id}>
-              <md-checkbox checked={rule.enabled} onInput={() => onUpdateRule(rule.id, { enabled: !rule.enabled })} aria-label={`启用 ${rule.source}`} />
+              <md-checkbox
+                checked={rule.enabled}
+                onInput={(event: any) => {
+                  // 先还原勾选状态，等预览确认后再真正提交
+                  event.currentTarget.checked = rule.enabled;
+                  onRequestRuleEdit(rule.id, { enabled: !rule.enabled });
+                }}
+                aria-label={`启用 ${rule.source}`}
+                title="启停前会预览影响范围"
+              />
               <md-outlined-text-field
                 class="rule-source"
-                value={rule.source}
+                value={drafts[`${rule.id}:source`] ?? rule.source}
                 label="原文"
-                onInput={(event: any) => onUpdateRule(rule.id, { source: event.currentTarget.value })}
+                onInput={(event: any) => setDrafts((current) => ({ ...current, [`${rule.id}:source`]: event.currentTarget.value }))}
+                onFocusOut={() => commitDraft(rule, 'source')}
+                onKeyDown={(event: KeyboardEvent) => { if (event.key === 'Enter') { event.preventDefault(); commitDraft(rule, 'source'); } }}
               />
               <md-outlined-text-field
                 class="rule-output"
-                value={rule.output}
+                value={drafts[`${rule.id}:output`] ?? rule.output}
                 label="盲文"
-                onInput={(event: any) => onUpdateRule(rule.id, { output: event.currentTarget.value })}
+                onInput={(event: any) => setDrafts((current) => ({ ...current, [`${rule.id}:output`]: event.currentTarget.value }))}
+                onFocusOut={() => commitDraft(rule, 'output')}
+                onKeyDown={(event: KeyboardEvent) => { if (event.key === 'Enter') { event.preventDefault(); commitDraft(rule, 'output'); } }}
               />
               <md-icon-button
                 class={rule.suspicious ? 'warning-button active' : 'warning-button'}
@@ -215,30 +335,38 @@ function LineCard({
   index,
   selected,
   issues,
+  ruleSet,
   onSelect,
   onChange,
   onNote,
   onStatus,
   onDelete,
+  onRemoveOverride,
 }: {
   line: TextbookLine;
   index: number;
   selected: boolean;
   issues: ProofIssue[];
+  ruleSet: RuleSet;
   onSelect: () => void;
   onChange: (source: string) => void;
   onNote: (note: string) => void;
   onStatus: (status: TextbookLine['status']) => void;
   onDelete: () => void;
+  onRemoveOverride: (ruleId: string) => void;
 }) {
   const unresolved = issues.filter((issue) => !issue.resolved);
   const lineIssues = unresolved.filter((issue) => issue.lineId === line.id);
+  const overrides = line.overrides ?? [];
 
   return (
-    <article class={`line-card ${selected ? 'selected' : ''}`} id={`line-card-${line.id}`} onClick={onSelect}>
+    <article class={`line-card ${selected ? 'selected' : ''} ${overrides.length > 0 ? 'has-override' : ''}`} id={`line-card-${line.id}`} onClick={onSelect}>
       <div class="line-gutter">
         <span>{String(index + 1).padStart(2, '0')}</span>
         <span class={`line-status ${line.status}`} title={`状态：${line.status}`} />
+        {overrides.length > 0 && (
+          <span class="override-dot" title={`本行使用 ${overrides.length} 条行级规则例外`}>例</span>
+        )}
       </div>
       <div class="line-body">
         <div class="line-source">
@@ -261,8 +389,8 @@ function LineCard({
           {line.tokens.map((token) => (
             token.text === ' ' ? <span class="space-token" title="分词空格" /> : (
               <span
-                class={`braille-token ${token.suspicious ? 'suspicious' : ''} ${token.braille.includes('⟦') ? 'error' : ''}`}
-                title={`${token.text || '标记'} → ${token.braille}`}
+                class={`braille-token ${token.suspicious ? 'suspicious' : ''} ${token.overridden ? 'overridden' : ''} ${token.braille.includes('⟦') ? 'error' : ''}`}
+                title={`${token.text || '标记'} → ${token.braille}${token.overridden ? '（行级例外）' : ''}`}
               >
                 <b>{token.text || '标记'}</b>
                 <span>{token.braille}</span>
@@ -270,6 +398,21 @@ function LineCard({
             )
           ))}
         </div>
+        {overrides.length > 0 && (
+          <div class="override-chips" aria-label="本行规则例外">
+            {overrides.map((override) => (
+              <span class="override-chip" key={override.ruleId}>
+                行级例外 · {describeOverride(override, ruleSet)}
+                <button
+                  class="chip-remove"
+                  aria-label="移除该例外"
+                  title="移除该例外，恢复跟随规则集"
+                  onClick={(event: MouseEvent) => { event.stopPropagation(); onRemoveOverride(override.ruleId); }}
+                >×</button>
+              </span>
+            ))}
+          </div>
+        )}
         {lineIssues.length > 0 && (
           <div class="line-warnings">
             {lineIssues.slice(0, 3).map((item) => (
@@ -300,6 +443,7 @@ function EditorPanel({
   onAddLine,
   onSplitLongLines,
   onImport,
+  onRemoveOverride,
 }: {
   state: ProjectState;
   onSelectLine: (id: string) => void;
@@ -310,9 +454,11 @@ function EditorPanel({
   onAddLine: () => void;
   onSplitLongLines: () => void;
   onImport: (text: string) => void;
+  onRemoveOverride: (lineId: string, ruleId: string) => void;
 }) {
   const [showImport, setShowImport] = useState(false);
   const [importText, setImportText] = useState('');
+  const activeRuleSet = state.ruleSets.find((ruleSet) => ruleSet.id === state.activeRuleSetId) ?? state.ruleSets[0];
 
   return (
     <main class="editor-panel" aria-label="逐行转录校对区">
@@ -362,11 +508,13 @@ function EditorPanel({
             index={index}
             selected={state.selectedLineId === line.id}
             issues={state.issues}
+            ruleSet={activeRuleSet}
             onSelect={() => onSelectLine(line.id)}
             onChange={(source) => onChangeLine(line.id, source)}
             onNote={(note) => onNote(line.id, note)}
             onStatus={(status) => onStatus(line.id, status)}
             onDelete={() => onDelete(line.id)}
+            onRemoveOverride={(ruleId) => onRemoveOverride(line.id, ruleId)}
           />
         ))}
       </div>
@@ -482,12 +630,14 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
 export default function App() {
   const { state, history, commit, undo, redo, restore } = useProject();
   const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const [pendingEdit, setPendingEdit] = useState<PendingRuleEdit | null>(null);
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
 
   const activeRuleSet = state.ruleSets.find((ruleSet) => ruleSet.id === state.activeRuleSetId) ?? state.ruleSets[0];
   const unresolvedCount = state.issues.filter((issue) => !issue.resolved).length;
   const approvedCount = state.lines.filter((line) => line.status === 'approved').length;
+  const overrideLineCount = state.lines.filter((line) => (line.overrides ?? []).length > 0).length;
   const progress = state.lines.length ? Math.round((approvedCount / state.lines.length) * 100) : 0;
 
   const selectLine = (lineId: string, scroll = false) => {
@@ -515,6 +665,14 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      // 预览对话框打开时屏蔽其他快捷键，Escape 取消修改
+      if (pendingEdit) {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          setPendingEdit(null);
+        }
+        return;
+      }
       const modifier = event.metaKey || event.ctrlKey;
       const target = event.target as HTMLElement;
       const editing = /INPUT|TEXTAREA/.test(target.tagName) || target.isContentEditable;
@@ -591,6 +749,52 @@ export default function App() {
     });
   };
 
+  /** 规则编辑入口：先计算影响范围并弹出预览，确认后才真正提交。 */
+  const requestRuleEdit = (ruleId: string, patch: Partial<TranscriptionRule>) => {
+    setPendingEdit({ ruleId, patch, items: previewRuleImpact(state, ruleId, patch), lineId: state.selectedLineId });
+  };
+
+  /** 预览确认：应用到全文，并清理与新全局值一致的冗余行级例外。 */
+  const applyRuleToAll = () => {
+    if (!pendingEdit) return;
+    const { ruleId, patch } = pendingEdit;
+    commit('修改转录规则（预览确认）', (current) => {
+      const ruleSet = current.ruleSets.find((set) => set.id === current.activeRuleSetId) ?? current.ruleSets[0];
+      const nextSet = updateRuleInSet(ruleSet, ruleId, patch);
+      const ruleSets = current.ruleSets.map((set) => (set.id === nextSet.id ? nextSet : set));
+      const lines = current.lines.map((line) =>
+        line.overrides?.length ? { ...line, overrides: normalizeOverrides(nextSet, line.overrides) } : line,
+      );
+      return analyzeProject({ ...current, ruleSets, lines });
+    });
+    setPendingEdit(null);
+  };
+
+  /** 预览确认：只应用到当前行，记为该行的规则例外，全局规则保持不变。 */
+  const applyRuleToLine = () => {
+    if (!pendingEdit) return;
+    const { ruleId, patch, lineId } = pendingEdit;
+    commit('添加行级规则例外', (current) => {
+      const ruleSet = current.ruleSets.find((set) => set.id === current.activeRuleSetId) ?? current.ruleSets[0];
+      const lines = current.lines.map((line) =>
+        line.id === lineId
+          ? { ...line, overrides: normalizeOverrides(ruleSet, mergeOverride(line.overrides ?? [], ruleId, patch)) }
+          : line,
+      );
+      return analyzeProject({ ...current, lines });
+    });
+    setPendingEdit(null);
+  };
+
+  const removeOverride = (lineId: string, ruleId: string) => {
+    commit('移除行级规则例外', (current) => analyzeProject({
+      ...current,
+      lines: current.lines.map((line) =>
+        line.id === lineId ? { ...line, overrides: (line.overrides ?? []).filter((item) => item.ruleId !== ruleId) } : line,
+      ),
+    }));
+  };
+
   const batchFixRule = (ruleId: string) => {
     commit('批量修正同类问题', (current) => {
       const ruleSet = current.ruleSets.find((set) => set.id === current.activeRuleSetId) ?? current.ruleSets[0];
@@ -641,6 +845,7 @@ export default function App() {
         <div class="status-stat warning"><strong>{unresolvedCount}</strong><span>未处理问题</span></div>
         <div class="status-stat"><strong>{state.lines.filter((line) => line.status === 'questionable').length}</strong><span>待核对行</span></div>
         <div class="status-stat"><strong>{activeRuleSet.rules.filter((rule) => rule.enabled).length}</strong><span>启用规则</span></div>
+        <div class="status-stat override-stat" title="使用行级规则例外的课文行数"><strong>{overrideLineCount}</strong><span>行级例外</span></div>
         <div class="shortcut-hint">快捷键：⌘/Ctrl Z 撤销 · ⇧⌘/Ctrl Z 重做 · ⌘/Ctrl Enter 批准并下一行 · J/K 切换行</div>
       </div>
 
@@ -649,6 +854,7 @@ export default function App() {
           state={state}
           onSelect={(id) => commit('切换规则集并重新检查', (current) => analyzeProject({ ...current, activeRuleSetId: id, issues: [] }))}
           onUpdateRule={updateRule}
+          onRequestRuleEdit={requestRuleEdit}
           onToggleContractions={() => {
             const ruleSet = activeRuleSet;
             commit('切换缩写规则', (current) => analyzeProject({ ...current, ruleSets: current.ruleSets.map((set) => set.id === ruleSet.id ? { ...set, contractions: !set.contractions } : set) }));
@@ -684,6 +890,7 @@ export default function App() {
             return analyzeProject({ ...current, lines });
           })}
           onImport={importCourse}
+          onRemoveOverride={removeOverride}
         />
 
         <aside class="right-panel">
@@ -713,6 +920,17 @@ export default function App() {
           }} />}
         </aside>
       </div>
+
+      {pendingEdit && (
+        <RuleImpactDialog
+          pending={pendingEdit}
+          rule={activeRuleSet.rules.find((rule) => rule.id === pendingEdit.ruleId)}
+          currentLineIndex={state.lines.findIndex((line) => line.id === pendingEdit.lineId)}
+          onCancel={() => setPendingEdit(null)}
+          onApplyLine={applyRuleToLine}
+          onApplyAll={applyRuleToAll}
+        />
+      )}
     </div>
   );
 }

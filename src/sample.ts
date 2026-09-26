@@ -79,7 +79,7 @@ const base: ProjectState = {
   ruleSets,
   selectedLineId: 'line-1',
   lines: [
-    { id: 'line-1', source: 'The small seed is under the soil.', tokens: [], status: 'questionable', note: '“the”是否符合学生当前缩写进度？', continuesPrevious: false, continuesNext: false },
+    { id: 'line-1', source: 'The small seed is under the soil.', tokens: [], status: 'questionable', note: '“the”是否符合学生当前缩写进度？', continuesPrevious: false, continuesNext: false, overrides: [{ ruleId: 'contraction-the', enabled: false }] },
     { id: 'line-2', source: 'It needs water, light and time.', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false },
     { id: 'line-3', source: 'By Friday, a green shoot appears.', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false },
     { id: 'line-4', source: 'The gardener said, “Welcome, little sprout!”', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false },
